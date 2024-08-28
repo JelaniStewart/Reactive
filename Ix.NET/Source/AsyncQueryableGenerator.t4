@@ -1,0 +1,368 @@
+<#@ assembly name="System.Core" #>
+<#@ assembly name="System.Runtime" #>
+<#@ import namespace="System.Linq" #>
+<#@ import namespace="System.Reflection" #>
+<#@ import namespace="System.Text" #>
+<#@ import namespace="System.Threading" #>
+<#@ import namespace="System.Threading.Tasks" #>
+<#@ import namespace="System.Collections.Generic" #>
+<#
+var infoFieldNames = new Dictionary<string, int>();
+
+var toQuotedImpl = default(Func<Type, ParameterInfo, int, bool, string>);
+toQuotedImpl = (t, paramObjectForAttributes, parameterIndex, notNestedGenericTypeParameter) =>
+{
+var name = t.Name;
+
+// We always want to look at the whole-type nullability, so we look at that now, and if it's a generic
+// type, we'll also go on to inspect per-type-parameter nullability.
+var nullableData = paramObjectForAttributes?.GetCustomAttributesData().SingleOrDefault(ad => ad.AttributeType.FullName == "System.Runtime.CompilerServices.NullableAttribute");
+bool wholeTypeNullable = false;
+if (nullableData is not null)
+{
+    if (nullableData.ConstructorArguments[0].Value is IReadOnlyList<CustomAttributeTypedArgument> nullableFlags)
+    {
+        // When we end up in this part, the type argument is, in practice, being used as the type argument to
+        // the actual type. E.g., ValueTask<TSource?>. So we need to look at the second nullable flag.
+        wholeTypeNullable = ((byte)nullableFlags[1].Value) == 2;
+    }
+    else if (nullableData.ConstructorArguments[0].Value is byte bv)
+    {
+        wholeTypeNullable = bv == 2;
+    }
+}
+if (t.IsGenericType)
+{
+    var genDef = t.GetGenericTypeDefinition();
+    name = genDef.Name.Substring(0, genDef.Name.LastIndexOf('`'));
+
+    Type[] genericArguments = t.GetGenericArguments();
+    bool[] typeParamsNullable = new bool[genericArguments.Length];
+    if (nullableData is not null)
+    {
+        if (nullableData.ConstructorArguments[0].Value is IReadOnlyList<CustomAttributeTypedArgument> nullableFlags)
+        {
+            // There isn't a 1-1 correspondence between type parameters and nullable flags. Really we should be recursively
+            // walking the type parameters, but this hack suffices for the types we actually encounter in practice.
+            int flagIndex = 1;
+            for (int i = 0; i < typeParamsNullable.Length; ++i)
+            {
+                if (!genericArguments[i].IsValueType)
+                {
+                    if (flagIndex >= nullableFlags.Count) throw new InvalidOperationException($"Type {t} has {typeParamsNullable.Length} type params, but the associated nullable attribute on parameterinto {paramObjectForAttributes} has length {nullableFlags.Count}");
+                    typeParamsNullable[i] = ((byte)nullableFlags[flagIndex].Value) == 2;
+                    flagIndex += 1;
+                }
+            }
+        }
+    }
+
+    var genArgs = "<" + string.Join(", ", genericArguments.Select((a, i) => toQuotedImpl(a, null, parameterIndex, false) + (typeParamsNullable[i] ? "?" : ""))) + ">";
+
+    if (notNestedGenericTypeParameter)
+    {
+        if (name == "Func" || name == "Action")
+        {
+            name = "Expression<" + name + genArgs + ">";
+        }
+        else if (name == "IAsyncEnumerable" && parameterIndex == 0)
+        {
+            name = "IAsyncQueryable" + genArgs;
+        }
+        else if (name == "IOrderedAsyncEnumerable" && parameterIndex == 0)
+        {
+            name = "IOrderedAsyncQueryable" + genArgs;
+        }
+        else
+        {
+            name += genArgs;
+        }
+
+        //if (wholeTypeNullable) { name += "?"; }
+    }
+    else
+    {
+        if (name == "Nullable")
+        {
+            name = genArgs.Substring(1, genArgs.Length - 2) + "?";
+        }
+        else
+        {
+            name += genArgs;
+            if (wholeTypeNullable) { name += "?"; }
+        }
+    }
+}
+else if (t.IsArray)
+{
+    var elem = toQuotedImpl(t.GetElementType(), null, parameterIndex, notNestedGenericTypeParameter);
+    name = elem + "[]";
+}
+else
+{
+    if (t == typeof(int))
+    {
+        name = "int";
+    }
+    else if (t == typeof(long))
+    {
+        name = "long";
+    }
+    else if (t == typeof(float))
+    {
+        name = "float";
+    }
+    else if (t == typeof(double))
+    {
+        name = "double";
+    }
+    else if (t == typeof(decimal))
+    {
+        name = "decimal";
+    }
+    else if (t == typeof(bool))
+    {
+        name = "bool";
+    }
+    else if (t == typeof(object))
+    {
+        name = "object";
+    }
+    if (wholeTypeNullable) { name += "?"; }
+}
+
+return name;
+};
+
+var toQuoted = new Func<Type, ParameterInfo, int, string>((t, paramObjectForAttributes, parameterIndex) => toQuotedImpl(t, paramObjectForAttributes, parameterIndex, true));
+#>
+#nullable enable
+
+using System.Collections.Generic;
+using System.Linq.Expressions;
+using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace System.Linq
+{
+    public static partial class <#=className#>
+    {
+<#
+// NOTE: Just including extension methods
+foreach (var m in asyncEnumerableType.GetMethods()
+                        .Where(m => m.IsStatic)
+                        .Where(m => !exclude.Contains(m.Name))
+                        .Where(m => m.IsDefined(typeof(System.Runtime.CompilerServices.ExtensionAttribute), true))
+                        .Where(m =>
+                        {
+                            var p0 = m.GetParameters()[0].ParameterType;
+                            if (p0.IsGenericType)
+                            {
+                                var p0d = p0.GetGenericTypeDefinition();
+                                return p0d == typeof(IAsyncEnumerable<>) || p0d == typeof(IOrderedAsyncEnumerable<>);
+                            }
+
+                            return false;
+                        })
+                        .OrderBy(m => m.Name)
+                        .ThenBy(m => m.IsGenericMethod ? m.GetGenericArguments().Length : 0)
+                        .ThenBy(m => m.GetParameters().Length)
+                        .ThenBy(m => string.Join(", ", m.GetParameters().Select((p, i) => toQuoted(p.ParameterType, p, i) + " " + p.Name))))
+{
+    var genArgs = m.GetGenericArguments();
+
+    var ret = toQuoted(m.ReturnType, m.ReturnParameter, 0);
+    var name = m.Name;
+
+    if (genArgs.Length > 0)
+    {
+        name += "<" + string.Join(", ", genArgs.Select((a, i) => a.Name)) + ">";
+    }
+
+    var isParams = false;
+    var lastParameterDefault = false;
+    var parCount = m.GetParameters().Length;
+
+    if (parCount != 0)
+    {
+        var lastParam = m.GetParameters().Last();
+
+        if (lastParam.IsDefined(typeof(ParamArrayAttribute), true))
+        {
+            isParams = true;
+        }
+
+        if (lastParam.ParameterType == typeof(CancellationToken))
+        {
+            lastParameterDefault = true;
+        }
+    }
+
+    var pars = string.Join(", ", m.GetParameters().Select((p, i) => (i == parCount - 1 && isParams ? "params " : "") + toQuoted(p.ParameterType, p, i) + (nullableParameterNames.Contains(p.Name) ? "?" : "") + " " + p.Name + (i == parCount - 1 && lastParameterDefault ? " = default" : "")));
+    var quotedPars = string.Join(", ", m.GetParameters().Select((p, i) => "default(" + toQuoted(p.ParameterType, p, i) + ")"));
+
+    if (m.IsDefined(typeof(System.Runtime.CompilerServices.ExtensionAttribute), true))
+    {
+        pars = "this " + pars;
+    }
+
+    var infoName = m.Name;
+    var infoTypeArgs = "";
+    var infoToGeneric = "";
+    var infoMakeGeneric = "";
+    var infoGenArgs = "";
+
+    if (genArgs.Length > 0)
+    {
+        infoName += "__" + string.Join("_", genArgs.Select(a => a.Name));
+        infoTypeArgs = "(" + string.Join(", ", genArgs.Select(a => "Type " + a.Name)) + ")";
+        infoToGeneric = "!.GetGenericMethodDefinition()";
+        infoMakeGeneric = ".MakeGenericMethod(" + string.Join(", ", genArgs.Select(a => a.Name)) + ")";
+        infoGenArgs = "<" + string.Join(", ", genArgs.Select(_ => "object")) + ">";
+    }
+
+    infoName += "__" + parCount + "__";
+
+    int infoNameCount;
+    if (!infoFieldNames.TryGetValue(infoName, out infoNameCount))
+    {
+        infoNameCount = 0;
+    }
+
+    var infoNameId = infoNameCount++;
+
+    infoFieldNames[infoName] = infoNameCount;
+
+    infoName += infoNameId;
+
+    var infoSignature = string.Join(", ", m.GetParameters().Select((p, i) => toQuoted(p.ParameterType, p, i)).Concat(new[] { toQuoted(m.ReturnType, m.ReturnParameter, 0) }));
+
+    foreach (var genArg in genArgs)
+    {
+        infoSignature = infoSignature.Replace(genArg.Name, "object");
+    }
+
+    var mtd = infoName;
+
+    if (m.IsGenericMethod)
+    {
+        mtd += "(" + string.Join(", ", genArgs.Select(a => "typeof(" + a.Name + ")")) + ")";
+    }
+
+    var provider = m.GetParameters()[0].Name + ".Provider";
+    var factory = "";
+    var rem = "";
+    var cast = "";
+    var quotedArgs = new List<string>();
+
+    if (m.ReturnType.IsGenericType)
+    {
+        var td = m.ReturnType.GetGenericTypeDefinition();
+
+        if (td.Name.EndsWith("Task`1")) // NB: Covers Task and ValueTask
+        {
+            factory = "ExecuteAsync<" + toQuotedImpl(m.ReturnType.GetGenericArguments()[0], m.ReturnParameter, -1, false) + ">";
+
+            var last = m.GetParameters().Last();
+            if (last.ParameterType == typeof(CancellationToken))
+            {
+                rem = ", " + last.Name;
+            }
+            else
+            {
+                rem = ", CancellationToken.None";
+            }
+        }
+        else if (td == typeof(IAsyncEnumerable<>) || td == typeof(IOrderedAsyncEnumerable<>))
+        {
+            factory = "CreateQuery<" + toQuotedImpl(m.ReturnType.GetGenericArguments()[0], null, -1, false) + ">";
+
+            if (td == typeof(IOrderedAsyncEnumerable<>))
+            {
+                cast = "(" + toQuoted(m.ReturnType, null, 0) + ")";
+            }
+        }
+    }
+
+    var n = 0;
+    foreach (var p in m.GetParameters())
+    {
+        var pt = p.ParameterType;
+
+        var add = false;
+
+        if (pt.IsGenericType)
+        {
+            var ptd = pt.GetGenericTypeDefinition();
+
+            if (ptd == typeof(IAsyncEnumerable<>) || ptd == typeof(IOrderedAsyncEnumerable<>))
+            {
+                if (n == 0)
+                {
+                    quotedArgs.Add(p.Name + ".Expression");
+                }
+                else
+                {
+                    quotedArgs.Add("GetSourceExpression(" + p.Name + ")");
+                }
+                add = true;
+            }
+            else if (ptd.Name.StartsWith("Func") || ptd.Name.StartsWith("Action"))
+            {
+                quotedArgs.Add(p.Name);
+                add = true;
+            }
+        }
+        
+        if (!add)
+        {
+            quotedArgs.Add("Expression.Constant(" + p.Name + ", typeof(" + toQuoted(pt, null, -1) + "))");
+        }
+
+        n++;
+    }
+
+    var expr = "Expression.Call(" + mtd + ", " + string.Join(", ", quotedArgs) + ")";
+
+    var cons = name.StartsWith("ToDictionary") ? " where TKey : notnull" : "";
+#>
+        private static MethodInfo? s_<#=infoName#>;
+        
+        private static MethodInfo <#=infoName#><#=infoTypeArgs#> =>
+            (s_<#=infoName#> ??
+            (s_<#=infoName#> = new Func<<#=infoSignature#>>(<#=m.Name#><#=infoGenArgs#>).GetMethodInfo()<#=infoToGeneric#>))<#=infoMakeGeneric#>;
+
+        public static <#=ret#> <#=name#>(<#=pars#>)<#=cons#>
+        {
+<#
+var any = false;
+foreach (var p in m.GetParameters())
+{
+    if (!p.ParameterType.IsValueType && !p.ParameterType.IsGenericParameter && !nullableParameterNames.Contains(p.Name))
+    {
+        any = true;
+#>
+            if (<#=p.Name#> == null)
+                throw new ArgumentNullException(nameof(<#=p.Name#>));
+<#
+    }
+}
+#>
+<#
+if (any)
+{
+#>
+
+<#
+}
+
+#>
+            return <#=cast#><#=provider#>.<#=factory#>(<#=expr#><#=rem#>);
+        }
+
+<#
+}
+#>
+    }
+}
